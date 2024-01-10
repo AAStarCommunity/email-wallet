@@ -1,398 +1,714 @@
-// use ethers_core::utils::CompiledContract;
-// use ethers_providers::{Http, Middleware, Provider};
-// use ethers_signers::{LocalWallet, Signer};
+use std::str::FromStr;
 
-use dotenv::dotenv;
-use ethers::abi::Abi;
-// use ethers::contract::ContractError;
+use crate::shared;
+use shared::SHARED_MUTEX;
+
+use crate::*;
+use ethers::abi::RawLog;
+use ethers::middleware::Middleware;
 use ethers::prelude::*;
-use anyhow::{Error};
-use ethers::core::types::{Address, U256, H160, H256};
-use ethers::providers::{Http, Middleware, Provider};
-use ethers::signers::{LocalWallet, Signer};
-use crate::strings::{reply_with_etherscan};
-use crate::config::{INCOMING_EML_PATH, ETHERSCAN_KEY, LOGIN_ID_KEY, LOGIN_PASSWORD_KEY, SMTP_DOMAIN_NAME_KEY};
-use crate::smtp_client::EmailSenderClient;
-// use hex_literal::hex;
-use k256::ecdsa::SigningKey;
-use serde_json::Value;
-use std::convert::TryFrom;
-use std::env;
-use std::fs;
-use std::str::{self, FromStr};
-// use std::error::Error;
-// use rand::thread_rng;
-// use std::borrow::Borrow;
-// use rustc_hex::{FromHex, ToHex};
-// use std::sync::Arc;
+use ethers::signers::Signer;
 
-pub type SignerType = SignerMiddleware<Provider<Http>, Wallet<SigningKey>>;
-pub type ClientType = NonceManagerMiddleware<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>>;
+const CONFIRMATIONS: usize = 1;
+
+#[derive(Default, Debug)]
+pub struct AccountCreationInput {
+    pub(crate) email_addr_pointer: [u8; 32],
+    pub(crate) account_key_commit: [u8; 32],
+    pub(crate) wallet_salt: [u8; 32],
+    pub(crate) psi_point: Bytes,
+    pub(crate) proof: Bytes,
+}
+
+#[derive(Default, Debug)]
+pub struct AccountInitInput {
+    pub(crate) email_addr_pointer: [u8; 32],
+    pub(crate) email_domain: String,
+    pub(crate) email_timestamp: U256,
+    pub(crate) email_nullifier: [u8; 32],
+    pub(crate) dkim_public_key_hash: [u8; 32],
+    pub(crate) proof: Bytes,
+}
+
+#[derive(Default, Debug)]
+pub struct AccountTransportInput {
+    pub(crate) old_account_key_commit: [u8; 32],
+    pub(crate) new_email_addr_pointer: [u8; 32],
+    pub(crate) new_account_key_commit: [u8; 32],
+    pub(crate) new_psi_point: Bytes,
+    pub(crate) transport_email_proof: EmailProof,
+    pub(crate) account_creation_proof: Bytes,
+}
+
+#[derive(Default, Debug)]
+pub struct RegisterUnclaimedFundInput {
+    pub(crate) email_addr_commit: [u8; 32],
+    pub(crate) token_addr: Address,
+    pub(crate) amount: U256,
+    pub(crate) expiry_time: U256,
+    pub(crate) announce_commit_randomness: U256,
+    pub(crate) announce_email_addr: String,
+}
+
+#[derive(Default, Debug)]
+pub struct ClaimInput {
+    pub(crate) id: U256,
+    pub(crate) email_addr_pointer: [u8; 32],
+    pub(crate) is_fund: bool,
+    pub(crate) proof: Bytes,
+}
+
+type SignerM = SignerMiddleware<Provider<Http>, LocalWallet>;
+
 #[derive(Debug, Clone)]
-pub struct CircomCalldata {
-    pi_a: [U256; 2],
-    pi_b: [[U256; 2]; 2],
-    pi_c: [U256; 2],
-    signals: [U256; 27],
+pub struct ChainClient {
+    pub client: Arc<SignerM>,
+    pub(crate) core: EmailWalletCore<SignerM>,
+    pub(crate) token_registry: TokenRegistry<SignerM>,
+    pub(crate) account_handler: AccountHandler<SignerM>,
+    pub(crate) extension_handler: ExtensionHandler<SignerM>,
+    pub(crate) relayer_handler: RelayerHandler<SignerM>,
+    pub(crate) unclaims_handler: UnclaimsHandler<SignerM>,
+    pub(crate) ecdsa_owned_dkim_registry: ECDSAOwnedDKIMRegistry<SignerM>,
+    pub(crate) test_erc20: TestERC20<SignerM>,
 }
 
-// Define a new function that takes optional arguments and provides default values
-pub fn get_calldata(dir: Option<&str>, nonce: Option<&str>) -> Result<CircomCalldata, Error> {
-    // Provide default values if arguments are not specified
-    let dir = dir.unwrap_or("");
-    let nonce = nonce.unwrap_or("");
-
-    // Call the main function with the specified or default values
-    parse_files_into_calldata(dir, nonce)
-}
-
-// #[tokio::main]
-// async
-fn parse_files_into_calldata(
-    dir: &str,
-    nonce: &str,
-) -> Result<CircomCalldata, Error> {
-    let proof_dir = dir.to_owned() + "rapidsnark_proof_" + nonce + ".json";
-    let proof_json: Value = serde_json::from_str(&fs::read_to_string(proof_dir).unwrap()).unwrap();
-    let public_json: Value = serde_json::from_str(
-        &fs::read_to_string(dir.to_owned() + "rapidsnark_public_" + nonce + ".json").unwrap(),
-    )
-    .unwrap();
-
-    let pi_a: [U256; 2] = [
-        U256::from_dec_str(proof_json["pi_a"][0].as_str().unwrap()).unwrap(),
-        U256::from_dec_str(proof_json["pi_a"][1].as_str().unwrap()).unwrap(),
-    ];
-
-    let pi_b_raw: [[U256; 2]; 2] = [
-        [
-            U256::from_dec_str(proof_json["pi_b"][0][0].as_str().unwrap()).unwrap(),
-            U256::from_dec_str(proof_json["pi_b"][0][1].as_str().unwrap()).unwrap(),
-        ],
-        [
-            U256::from_dec_str(proof_json["pi_b"][1][0].as_str().unwrap()).unwrap(),
-            U256::from_dec_str(proof_json["pi_b"][1][1].as_str().unwrap()).unwrap(),
-        ],
-    ];
-
-    // Swap the G2 points to be the correct order with the new snarkjs
-    let pi_b_swapped: Vec<[U256; 2]> = pi_b_raw.iter().map(|inner| [inner[1], inner[0]]).collect();
-
-    // Convert the Vec to an array
-    let pi_b: [[U256; 2]; 2] = [pi_b_swapped[0], pi_b_swapped[1]];
-
-    let pi_c: [U256; 2] = [
-        U256::from_dec_str(proof_json["pi_c"][0].as_str().unwrap()).unwrap(),
-        U256::from_dec_str(proof_json["pi_c"][1].as_str().unwrap()).unwrap(),
-    ];
-
-    let signals_vec = public_json
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| U256::from_dec_str(x.as_str().unwrap()).unwrap())
-        .collect::<Vec<_>>();
-
-    println!("signals_vec: {:?}", signals_vec);
-
-    let signals: [U256; 27] = signals_vec
-        .as_slice()
-        .try_into()
-        .unwrap();
-
-    let calldata = CircomCalldata {
-        pi_a,
-        pi_b,
-        pi_c,
-        signals,
-    };
-    Ok(calldata)
-}
-
-pub enum AbiType {
-    Wallet,
-    ERC20,
-    TokenRegistry,
-}
-
-pub async fn get_provider(force_localhost: bool) -> Result<Provider<Http>, Error> {
-    // let alchemy_api_key = std::env::var("ALCHEMY_GOERLI_KEY").unwrap();
-    // println!("alchemy_api_key: {}", alchemy_api_key);
-    let rpcurl = if force_localhost {
-        "http://localhost:8548".to_string()
-    } else {
-        std::env::var("RPC_URL").expect("The RPC_URL environment variable must be set")
-    };
-    // Get the private key from the environment variable
-    println!("Got provider for rpcurl: {}", rpcurl);
-
-    let provider = Provider::<Http>::try_from(rpcurl)?;
-    Ok(provider)
-}
-
-pub async fn get_gas_price(force_localhost: bool) -> Result<U256, Error> {
-    let provider = (get_provider(force_localhost).await).unwrap();
-    let gas_price = provider.get_gas_price().await?;
-    Ok(gas_price)
-}
-
-pub fn get_abi(abi_type: AbiType) -> Result<Abi, Error> {
-    // Read the contents of the ABI file as bytes
-    let abi_bytes: &[u8] = match abi_type {
-        AbiType::Wallet => include_bytes!("../abi/wallet.abi"),
-        AbiType::TokenRegistry => include_bytes!("../abi/tokenRegistry.abi"),
-        AbiType::ERC20 => include_bytes!("../abi/erc20.abi"),
-    };
-    // Convert the bytes to a string
-    let abi_str = str::from_utf8(abi_bytes)?;
-    // Parse the string as JSON to obtain the ABI
-    let abi_json: Value = serde_json::from_str(abi_str)?;
-    // Convert the JSON value to the Abi type
-    let abi: Abi = serde_json::from_value(abi_json)?;
-    Ok(abi)
-}
-
-pub async fn get_signer(force_localhost: bool) -> Result<SignerType, Error> {
-    let chain_id: u64 = std::env::var("CHAIN_ID")
-        .expect("The CHAIN_ID environment variable must be set")
-        .parse()?;
-    let provider = (get_provider(force_localhost).await).unwrap();
-    let private_key_hex =
-        std::env::var("PRIVATE_KEY").expect("The PRIVATE_KEY environment variable must be set");
-    let wallet: LocalWallet = LocalWallet::from_str(&private_key_hex)?;
-    let address = wallet.address();
-    let signer = SignerMiddleware::new(provider, wallet.with_chain_id(chain_id));
-    Ok(signer)
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct EtherscanResponse {
-    status: String,
-    message: String,
-    result: Vec<Transaction>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Transaction {
-    blockNumber: String,
-    timeStamp: String,
-    hash: String,
-    nonce: String,
-    blockHash: String,
-    transactionIndex: String,
-    from: String,
-    to: String,
-    value: String,
-    gas: String,
-    gasPrice: String,
-    isError: String,
-    txreceipt_status: String,
-    input: String,
-    contractAddress: String,
-    cumulativeGasUsed: String,
-    gasUsed: String,
-    confirmations: String,
-}
-
-pub async fn get_pending_tx_count(force_localhost: bool, wallet_address: H160) -> Result<usize, Error> {
-    Ok(0)
-    // Query the current nonce of the account
-    // let provider = (get_provider(force_localhost).await).unwrap();
-    // let current_nonce = provider.get_transaction_count(wallet_address, None).await.unwrap();
-
-    // // Get pending txes
-    // let etherscan_api_key = std::env::var(ETHERSCAN_KEY).expect("The ETHERSCAN_API_KEY environment variable must be set");
-    // let chain_id: u64 = std::env::var("CHAIN_ID").expect("The CHAIN_ID environment variable must be set").parse().unwrap();
-    // let etherscan_url = match chain_id {
-    //     5 => "https://goerli.etherscan.io",
-    //     1 => "https://etherscan.io",
-    //     42161 => "https://arbiscan.io",
-    //     10 => "https://optimistic.etherscan.io",
-    //     _ => panic!("Unsupported chain id"),
-    // };
-    // let url = format!("{}/api?module=account&action=txlist&address={}&startblock=0&endblock=999999999&sort=asc&apikey={}", etherscan_url, wallet_address, etherscan_api_key);
-    // println!("Etherscan Url: {}", url);
-    // let response_text = reqwest::get(&url).await?.text().await?;
-    // println!("API response: {}", response_text);
-    // let response: EtherscanResponse = serde_json::from_str(&response_text)?;
-
-    // // let response = reqwest::get(&url).await.expect("Failed to send pending tx request to Etherscan").json::<EtherscanResponse>().await.expect("Failed to parse Etherscan return value");
-
-    // let pending_transactions: Vec<Transaction> = response.result.into_iter().filter(|tx| tx.txreceipt_status == "Pending").collect();
-    // let pending_count = pending_transactions.len();
-
-    // println!("Pending transactions for {}: {}", wallet_address, pending_count);
-    // Ok(pending_count)
-}
-
-// local: bool - whether or not to send to a local RPC
-// dir: data directory where the intermediate rapidsnark inputs/proofs will be stored
-pub async fn send_to_chain(
-    force_localhost: bool,
-    dir: &str,
-    nonce: &str,
-) -> Result<(), Error> {
-    // Load environment variables from the .env file
-    dotenv().ok();
-    let contract_address: Address = std::env::var("CONTRACT_ADDRESS").unwrap().parse()?;
-    let signer_raw = get_signer(force_localhost).await.unwrap();
-    let sender_address = signer_raw.address().clone();
-    let signer = signer_raw.nonce_manager(sender_address);
-
-    let gas_price = get_gas_price(force_localhost).await.unwrap();
-
-    // Read proof and public parameters from JSON files
-    let calldata = get_calldata(Some(dir), Some(nonce)).unwrap();
-
-    // Initialize NonceManagerMiddleware
-    // let nonce_manager = NonceManagerMiddleware::new(signer, sender_address);
-        // let contract: ContractInstance<SignerMiddleware<Provider<Http>, Wallet<SigningKey>>, Abi> =
-        // ContractInstance::new(contract_address, get_abi(AbiType::Wallet).unwrap(), signer);
-    let contract = ContractInstance::<_, ClientType>::new(contract_address, get_abi(AbiType::Wallet).unwrap(), &signer);
-    // let contract = ContractInstance::new(contract_address, get_abi(AbiType::Wallet).unwrap(), signer);
-
-    signer.initialize_nonce(None).await?;
-
-    let pending_txes = get_pending_tx_count(force_localhost, sender_address).await.expect("Pending tx count failed");
-    for _ in 0..pending_txes {
-        let mut _nonce = signer.next();
+impl ChainClient {
+    pub async fn setup() -> Result<Self> {
+        let wallet: LocalWallet = PRIVATE_KEY.get().unwrap().parse()?;
+        let provider = Provider::<Http>::try_from(CHAIN_RPC_PROVIDER.get().unwrap())?;
+        let client = Arc::new(SignerMiddleware::new(
+            provider,
+            wallet.with_chain_id(*CHAIN_ID.get().unwrap()),
+        ));
+        let core = EmailWalletCore::new(
+            CORE_CONTRACT_ADDRESS.get().unwrap().parse::<Address>()?,
+            client.clone(),
+        );
+        let token_registry_addr = core.token_registry().call().await.unwrap();
+        let token_registry = TokenRegistry::new(token_registry_addr, client.clone());
+        let account_handler_addr = core.account_handler().call().await.unwrap();
+        let account_handler = AccountHandler::new(account_handler_addr, client.clone());
+        let extension_handler =
+            ExtensionHandler::new(core.extension_handler().call().await?, client.clone());
+        let relayer_handler =
+            RelayerHandler::new(core.relayer_handler().call().await.unwrap(), client.clone());
+        let unclaims_handler =
+            UnclaimsHandler::new(core.unclaims_handler().call().await?, client.clone());
+        let ecdsa_owned_dkim_registry = ECDSAOwnedDKIMRegistry::new(
+            account_handler.default_dkim_registry().await?,
+            client.clone(),
+        );
+        let test_erc20 = TestERC20::new(
+            token_registry.get_token_address("TEST".to_string()).await?,
+            client.clone(),
+        );
+        Ok(Self {
+            client,
+            core,
+            token_registry,
+            account_handler,
+            extension_handler,
+            relayer_handler,
+            unclaims_handler,
+            ecdsa_owned_dkim_registry,
+            test_erc20,
+        })
     }
 
-    println!("Sending transaction with gas price {:?}...", gas_price);
+    pub fn self_eth_addr(&self) -> Address {
+        self.client.address()
+    }
 
-    // Call the transfer function
-    let call = contract
-        .method::<_, ()>(
-            "transfer",
-            (
-                calldata.pi_a,
-                calldata.pi_b,
-                calldata.pi_c,
-                calldata.signals,
-            ),
-        )?
-        .gas_price(gas_price * 2);
+    pub async fn register_relayer(
+        &self,
+        rand_hash: Fr,
+        email_addr: String,
+        hostname: String,
+    ) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
 
-    println!("Calling call: {:?}", call);
+        let call =
+            self.relayer_handler
+                .register_relayer(fr_to_bytes32(&rand_hash)?, email_addr, hostname);
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
 
-    // Send the transaction with the updated nonce
-    let pending_tx = match call.send().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            println!("Error: {:?}", e);
-            reply_with_message(nonce, "Error sending transaction. Most likely your email domain is not supported (must be @gmail.com, @hotmail.com, @ethereum.org, or @skiff.com).", false);
-            println!("Error bytes: {:?}", e.as_revert());
-            return Err(e.into());
+    pub async fn create_account(&self, data: AccountCreationInput) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        let call = self.account_handler.create_account(
+            data.email_addr_pointer,
+            data.account_key_commit,
+            data.wallet_salt,
+            data.psi_point,
+            data.proof,
+        );
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub async fn init_account(&self, data: AccountInitInput) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        let call = self.account_handler.initialize_account(
+            data.email_addr_pointer,
+            data.email_domain,
+            data.email_timestamp,
+            data.email_nullifier,
+            data.dkim_public_key_hash,
+            data.proof,
+        );
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub async fn transport_account(&self, data: AccountTransportInput) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        let call = self.account_handler.transport_account(
+            data.old_account_key_commit,
+            data.new_email_addr_pointer,
+            data.new_account_key_commit,
+            data.new_psi_point,
+            data.transport_email_proof,
+            data.account_creation_proof,
+        );
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub async fn claim(&self, data: ClaimInput) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        if data.is_fund {
+            let call = self.unclaims_handler.claim_unclaimed_fund(
+                data.id,
+                data.email_addr_pointer,
+                data.proof,
+            );
+            let tx = call.send().await?;
+            let receipt = tx
+                .log()
+                .confirmations(CONFIRMATIONS)
+                .await?
+                .ok_or(anyhow!("No receipt"))?;
+            let tx_hash = receipt.transaction_hash;
+            let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+            Ok(tx_hash)
+        } else {
+            let call = self.unclaims_handler.claim_unclaimed_state(
+                data.id,
+                data.email_addr_pointer,
+                data.proof,
+            );
+            let tx = call.send().await?;
+            let receipt = tx
+                .log()
+                .confirmations(CONFIRMATIONS)
+                .await?
+                .ok_or(anyhow!("No receipt"))?;
+            let tx_hash = receipt.transaction_hash;
+            let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+            Ok(tx_hash)
         }
-    };
-    println!("Transaction hash: {:?}", pending_tx);
-    let etherscan_reply = reply_with_etherscan(pending_tx.tx_hash());
-    reply_with_message(nonce, &etherscan_reply, true);
-    Ok(())
-}
+    }
 
-fn reply_with_message(nonce: &str, reply: &str, send_to_recipient: bool) {
-    dotenv().ok();
-    let mut sender: EmailSenderClient = EmailSenderClient::new(
-        env::var(LOGIN_ID_KEY).unwrap().as_str(),
-        env::var(LOGIN_PASSWORD_KEY).unwrap().as_str(),
-        Some(env::var(SMTP_DOMAIN_NAME_KEY).unwrap().as_str()),
-    );
-    // Read raw email from received_eml/wallet_{nonce}.eml
-    let eml_var = env::var(INCOMING_EML_PATH).unwrap();
+    pub async fn void(&self, id: U256, is_fund: bool) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
 
-    let raw_email = fs::read_to_string(format!("{}/wallet_{}.eml", eml_var, nonce)).unwrap();
-    let confirmation = sender.reply_all(&raw_email, &reply, send_to_recipient);
-}
+        if is_fund {
+            let call = self.unclaims_handler.void_unclaimed_fund(id);
+            let tx = call.send().await?;
+            let receipt = tx
+                .log()
+                .confirmations(CONFIRMATIONS)
+                .await?
+                .ok_or(anyhow!("No receipt"))?;
+            let tx_hash = receipt.transaction_hash;
+            let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+            Ok(tx_hash)
+        } else {
+            let call = self.unclaims_handler.void_unclaimed_state(id);
+            let tx = call.send().await?;
+            let receipt = tx
+                .log()
+                .confirmations(CONFIRMATIONS)
+                .await?
+                .ok_or(anyhow!("No receipt"))?;
+            let tx_hash = receipt.transaction_hash;
+            let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+            Ok(tx_hash)
+        }
+    }
 
-pub async fn query_address(
-    force_localhost: bool,
-    user_salt: &str,
-) -> Result<H160, Error> {
-    // Load environment variables from the .env file
-    dotenv().ok();
-    let abi = get_abi(AbiType::Wallet)?;
-    let signer = get_signer(force_localhost).await?;
-    let logic_contract_address: Address = std::env::var("CONTRACT_ADDRESS").unwrap().parse()?;
-    let logic_contract = ContractInstance::new(logic_contract_address, abi, signer);
-    let decimal_salt_u256 = U256::from_dec_str(&user_salt)?;
-    let address_method = logic_contract.method::<_, Address>("getOrCreateWallet", decimal_salt_u256)?;
-    let address = address_method.call().await?;
-    Ok(address)
-}
+    #[named]
+    pub async fn handle_email_op(&self, email_op: EmailOp) -> Result<(String, U256)> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
 
-// Given an address and token, get the balance of that token for that address from the chain
-// This can be done on a local light node or fork to ensure future tx data is not leaked
-pub async fn query_balance(
-    force_localhost: bool,
-    user_address: &str,
-    token_name: &str,
-) -> Result<f64, Error> {
-    // Load environment variables from the .env file
-    dotenv().ok();
-    let abi = get_abi(AbiType::Wallet)?;
-    let signer = get_signer(force_localhost).await?;
-    let logic_contract_address: Address = std::env::var("CONTRACT_ADDRESS").unwrap().parse()?;
-    let logic_contract = ContractInstance::new(logic_contract_address, abi, signer);
-    let erc20_address_method = logic_contract.method::<_, Address>("getTokenAddress", "DAI".to_owned())?;
-    let erc20_address = erc20_address_method.call().await?;
-    let erc_contract = ContractInstance::new(erc20_address, get_abi(AbiType::ERC20).unwrap(), get_signer(force_localhost).await.unwrap());
-    // Call the balanceOf function on the ERC20 contract to get the raw balance in wei
-    let raw_balance: U256 = erc_contract
-        .method::<_, U256>("balanceOf", Address::from_str(user_address).unwrap())
-        .unwrap()
-        .call()
-        .await?;
-
-    // Call the decimals function on the ERC20 contract to get the decimal count
-    let decimals: U256 = erc_contract
-        .method::<_, U256>("decimals", ())
-        .unwrap()
-        .call()
-        .await?;
-
-    // Calculate the balance in tokens by dividing the raw balance by 10 to the power of the decimal count
-    let balance: f64 = raw_balance.low_u64() as f64 / 10f64.powi(decimals.as_u32() as i32);
-    Ok(balance)
-}
-
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_query_balance() {
-        dotenv::dotenv().ok();
-        let balance = query_balance(false, "0x11fE4B6AE13d2a6055C8D9cF65c55bac32B5d844", "DAI").await;
-
-        match balance {
-            Ok(bal) => {
-                assert!(bal > 0.0, "Balance must be more than 0");
-            },
-            Err(e) => {
-                println!("Error: {:?}", e);
-                assert!(false, "Error getting balance");
+        let value = if !email_op.has_email_recipient {
+            U256::zero()
+        } else if email_op.command == SEND_COMMAND {
+            let gas = self.unclaims_handler.unclaimed_fund_claim_gas().await?;
+            let fee = self.unclaims_handler.max_fee_per_gas().await?;
+            gas * fee
+        } else {
+            let gas = self.unclaims_handler.unclaimed_state_claim_gas().await?;
+            let fee = self.unclaims_handler.max_fee_per_gas().await?;
+            gas * fee
+        };
+        let call = self.core.handle_email_op(email_op);
+        let call = call.value(value);
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        for log in receipt.logs.into_iter() {
+            if let Ok(decoded) = EmailWalletEventsEvents::decode_log(&RawLog::from(log)) {
+                match decoded {
+                    EmailWalletEventsEvents::EmailOpHandledFilter(event) => {
+                        info!(LOG, "event {:?}", event; "func" => function_name!());
+                        return Ok((tx_hash, event.registered_unclaim_id));
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
             }
         }
+        Err(anyhow!("no EmailOpHandled event found in the receipt"))
     }
 
-    #[tokio::test]
-    async fn test_get_pending_tx_count() {
-        dotenv::dotenv().ok();
-        let wallet_address = "0x11fE4B6AE13d2a6055C8D9cF65c55bac32B5d844".parse().unwrap();
-        let pending_tx_count = get_pending_tx_count(false, wallet_address).await;
+    pub async fn set_dkim_public_key_hash(
+        &self,
+        selector: String,
+        domain_name: String,
+        public_key_hash: [u8; 32],
+        signature: Bytes,
+    ) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
 
-        match pending_tx_count {
-            Ok(count) => {
-                assert!(count >= 0, "Pending transaction count must be non-negative");
-            },
-            Err(e) => {
-                println!("Error: {:?}", e);
-                assert!(false, "Error getting pending transaction count");
+        let call = self.ecdsa_owned_dkim_registry.set_dkim_public_key_hash(
+            selector,
+            domain_name,
+            public_key_hash,
+            signature,
+        );
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub async fn free_mint_test_erc20(&self, wallet_addr: Address, amount: U256) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        let call = self.test_erc20.free_mint_with_to(wallet_addr, amount);
+        let tx = call.send().await?;
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub(crate) async fn transfer_onboarding_tokens(&self, wallet_addr: H160) -> Result<String> {
+        // Mutex is used to prevent nonce conflicts.
+        let mut mutex = SHARED_MUTEX.lock().await;
+        *mutex += 1;
+
+        let erc20 = ERC20::new(
+            ONBOARDING_TOKEN_ADDR.get().unwrap().to_owned(),
+            self.client.clone(),
+        );
+        let tx = erc20.transfer(
+            wallet_addr,
+            ONBOARDING_TOKEN_AMOUNT.get().unwrap().to_owned(),
+        );
+        let tx = tx.send().await?;
+
+        let receipt = tx
+            .log()
+            .confirmations(CONFIRMATIONS)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+
+        let tx_hash = receipt.transaction_hash;
+        let tx_hash = format!("0x{}", hex::encode(tx_hash.as_bytes()));
+        Ok(tx_hash)
+    }
+
+    pub async fn query_account_key_commit(&self, pointer: &Fr) -> Result<Fr> {
+        let account_key_commit = self
+            .account_handler
+            .account_key_commit_of_pointer(fr_to_bytes32(pointer)?)
+            .await?;
+        bytes32_to_fr(&account_key_commit)
+    }
+
+    pub async fn query_account_info(&self, account_key_commit: &Fr) -> Result<AccountKeyInfo> {
+        let info = self
+            .account_handler
+            .get_info_of_account_key_commit(fr_to_bytes32(account_key_commit)?)
+            .await?;
+        Ok(info)
+    }
+
+    pub async fn query_user_erc20_balance(
+        &self,
+        wallet_salt: &WalletSalt,
+        token_name: &str,
+    ) -> Result<U256> {
+        let token_addr = self
+            .token_registry
+            .get_token_address(token_name.to_string())
+            .call()
+            .await?;
+        let erc20 = ERC20::new(token_addr, self.client.clone());
+        let wallet_addr = self.get_wallet_addr_from_salt(&wallet_salt.0).await?;
+        let balance = erc20.balance_of(wallet_addr).call().await?;
+        Ok(balance)
+    }
+
+    pub async fn query_erc20_address(&self, token_name: &str) -> Result<Address> {
+        let token_addr = self
+            .token_registry
+            .get_token_address(token_name.to_string())
+            .call()
+            .await?;
+        Ok(token_addr)
+    }
+
+    pub async fn query_decimals_of_erc20(&self, token_name: &str) -> Result<u8> {
+        let token_addr = self
+            .token_registry
+            .get_token_address(token_name.to_string())
+            .call()
+            .await?;
+        self.query_decimals_of_erc20_address(token_addr).await
+    }
+
+    pub async fn query_decimals_of_erc20_address(&self, token_addr: Address) -> Result<u8> {
+        let erc20 = ERC20::new(token_addr, self.client.clone());
+        let decimals = erc20.decimals().call().await?;
+        Ok(decimals)
+    }
+
+    pub async fn query_token_name(&self, token_addr: Address) -> Result<String> {
+        let name = self
+            .token_registry
+            .get_token_name_of_address(token_addr)
+            .call()
+            .await?;
+        Ok(name)
+    }
+
+    pub async fn query_relayer_rand_hash(&self, relayer: Address) -> Result<Fr> {
+        let rand_hash = self.relayer_handler.get_rand_hash(relayer).call().await?;
+        bytes32_to_fr(&rand_hash)
+    }
+
+    pub async fn query_user_extension_for_command(
+        &self,
+        wallet_salt: &WalletSalt,
+        command: &str,
+    ) -> Result<Address> {
+        let wallet_addr = self.get_wallet_addr_from_salt(&wallet_salt.0).await?;
+        let extension_addr = self
+            .extension_handler
+            .get_extension_for_command(wallet_addr, command.to_string())
+            .call()
+            .await?;
+        Ok(extension_addr)
+    }
+
+    pub async fn query_subject_templates_of_extension(
+        &self,
+        extension_addr: Address,
+    ) -> Result<Vec<Vec<String>>> {
+        let templates = self
+            .extension_handler
+            .get_subject_templates_of_extension(extension_addr)
+            .call()
+            .await?;
+        Ok(templates)
+    }
+
+    pub async fn get_wallet_addr_from_salt(&self, wallet_salt: &Fr) -> Result<Address> {
+        let wallet_addr = self
+            .account_handler
+            .get_wallet_of_salt(fr_to_bytes32(wallet_salt)?)
+            .call()
+            .await?;
+        Ok(wallet_addr)
+    }
+
+    pub async fn query_rand_hash_of_relayer(&self, relayer: Address) -> Result<Fr> {
+        let rand_hash = self.relayer_handler.get_rand_hash(relayer).call().await?;
+        bytes32_to_fr(&rand_hash)
+    }
+
+    // pub async fn query_ak_commit_and_relayer_of_wallet_salt(
+    //     &self,
+    //     wallet_salt: &WalletSalt,
+    // ) -> Result<(Vec<Fr>, Vec<Address>)> {
+    //     let events: Vec<(email_wallet_events::AccountCreatedFilter, LogMeta)> = self
+    //         .account_handler
+    //         .event_for_name::<email_wallet_events::AccountCreatedFilter>("AccountCreated")?
+    //         .from_block(0)
+    //         .topic2(H256::from(fr_to_bytes32(&wallet_salt.0)?))
+    //         .query_with_meta()
+    //         .await?;
+    //     let mut account_key_commits = vec![];
+    //     let mut relayers = vec![];
+    //     for (created, log_meta) in events {
+    //         let account_key_commit = bytes32_to_fr(&created.account_key_commit)?;
+    //         account_key_commits.push(account_key_commit);
+    //         let tx_hash = log_meta.transaction_hash;
+    //         let tx = self.client.get_transaction(tx_hash).await?;
+    //         if let Some(tx) = tx {
+    //             let relayer = tx.from;
+    //             relayers.push(relayer);
+    //         }
+    //     }
+    //     Ok((account_key_commits, relayers))
+    // }
+
+    pub async fn query_unclaimed_fund(&self, id: U256) -> Result<UnclaimedFund> {
+        let unclaimed_fund = self.unclaims_handler.get_unclaimed_fund(id).await?;
+        Ok(unclaimed_fund)
+    }
+
+    pub async fn query_unclaimed_state(&self, id: U256) -> Result<UnclaimedState> {
+        let unclaimed_state = self.unclaims_handler.get_unclaimed_state(id).await?;
+        Ok(unclaimed_state)
+    }
+
+    #[named]
+    pub async fn get_unclaim_id_from_tx_hash(&self, tx_hash: &str, is_fund: bool) -> Result<U256> {
+        let receipt: TransactionReceipt = self
+            .client
+            .get_transaction_receipt(H256::from_str(tx_hash)?)
+            .await?
+            .ok_or(anyhow!("No receipt"))?;
+        info!(LOG, "receipt {:?}", receipt; "func" => function_name!());
+
+        for log in receipt.logs.into_iter() {
+            info!(LOG, "log {:?}", log; "func" => function_name!());
+            if let Ok(decoded) = EmailWalletEventsEvents::decode_log(&RawLog::from(log)) {
+                info!(LOG, "decoded {:?}", decoded; "func" => function_name!());
+                match decoded {
+                    EmailWalletEventsEvents::UnclaimedFundRegisteredFilter(event) => {
+                        if !is_fund {
+                            return Err(anyhow!(
+                                "the transaction does not register an unclaimed fund"
+                            ));
+                        }
+                        return Ok(event.id);
+                    }
+                    EmailWalletEventsEvents::UnclaimedStateRegisteredFilter(event) => {
+                        if is_fund {
+                            return Err(anyhow!(
+                                "the transaction does not register an unclaimed state"
+                            ));
+                        }
+                        return Ok(event.id);
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
             }
         }
+        Err(anyhow!(
+            "the transaction registers neither an unclaim fund nor state"
+        ))
+    }
+
+    pub async fn validate_email_op(&self, email_op: EmailOp) -> Result<()> {
+        let call = self.core.validate_email_op(email_op);
+        call.call().await?;
+        Ok(())
+    }
+
+    pub async fn stream_unclaim_fund_registration<
+        F: FnMut(email_wallet_events::UnclaimedFundRegisteredFilter, LogMeta) -> Result<()>,
+    >(
+        &self,
+        from_block: U64,
+        mut f: F,
+    ) -> Result<U64> {
+        let ev = self
+            .unclaims_handler
+            .event_for_name::<email_wallet_events::UnclaimedFundRegisteredFilter>(
+                "UnclaimedFundRegistered",
+            )?
+            .from_block(from_block);
+        let mut stream = ev.stream_with_meta().await?;
+        let mut last_block = from_block;
+        while let Some(Ok((event, meta))) = stream.next().await {
+            last_block = meta.block_number;
+            f(event, meta)?;
+        }
+        Ok(last_block)
+    }
+
+    pub async fn stream_unclaim_state_registration<
+        F: FnMut(email_wallet_events::UnclaimedStateRegisteredFilter, LogMeta) -> Result<()>,
+    >(
+        &self,
+        from_block: U64,
+        mut f: F,
+    ) -> Result<U64> {
+        let ev = self
+            .unclaims_handler
+            .event_for_name::<email_wallet_events::UnclaimedStateRegisteredFilter>(
+                "UnclaimedStateRegistered",
+            )?
+            .from_block(from_block);
+        let mut stream = ev.stream_with_meta().await?;
+        let mut last_block = from_block;
+        while let Some(Ok((event, meta))) = stream.next().await {
+            last_block = meta.block_number;
+            f(event, meta)?;
+        }
+        Ok(last_block)
+    }
+
+    pub(crate) async fn check_if_point_registered(&self, point: Point) -> Result<bool> {
+        let Point { x, y } = point;
+        let x = hex2field(&x)?;
+        let y = hex2field(&y)?;
+        let x = U256::from_little_endian(&x.to_bytes());
+        let y = U256::from_little_endian(&y.to_bytes());
+        let res = self
+            .account_handler
+            .pointer_of_psi_point(get_psi_point_bytes(x, y))
+            .call()
+            .await?;
+        let res = U256::from_little_endian(&res);
+        Ok(res == U256::zero())
+    }
+
+    pub(crate) async fn check_if_account_initialized_by_account_key(
+        &self,
+        email_addr: &str,
+        account_key: &str,
+    ) -> Result<bool> {
+        let account_key = AccountKey(hex2field(account_key)?);
+        let padded_email_addr = PaddedEmailAddr::from_email_addr(email_addr);
+        let relayer_rand = RelayerRand(hex2field(RELAYER_RAND.get().unwrap())?);
+        let account_key_commitment =
+            account_key.to_commitment(&padded_email_addr, &relayer_rand.hash()?)?;
+
+        let account_key_info = self
+            .account_handler
+            .info_of_account_key_commit(Fr::to_bytes(&account_key_commitment))
+            .call()
+            .await?;
+
+        Ok(account_key_info.1)
+    }
+
+    pub(crate) async fn check_if_account_initialized_by_point(&self, point: Point) -> Result<bool> {
+        let Point { x, y } = point;
+        let x = hex2field(&x)?;
+        let y = hex2field(&y)?;
+        let x = U256::from_little_endian(&x.to_bytes());
+        let y = U256::from_little_endian(&y.to_bytes());
+        let pointer = self
+            .account_handler
+            .pointer_of_psi_point(get_psi_point_bytes(x, y))
+            .call()
+            .await?;
+        let account_key_commitment = self
+            .account_handler
+            .account_key_commit_of_pointer(pointer)
+            .call()
+            .await?;
+        let account_key_info = self
+            .account_handler
+            .info_of_account_key_commit(account_key_commitment)
+            .call()
+            .await?;
+
+        Ok(account_key_info.1)
+    }
+
+    #[named]
+    pub(crate) async fn check_if_dkim_public_key_hash_valid(
+        &self,
+        domain_name: ::std::string::String,
+        public_key_hash: [u8; 32],
+    ) -> Result<bool> {
+        let is_valid = self
+            .ecdsa_owned_dkim_registry
+            .is_dkim_public_key_hash_valid(domain_name.clone(), public_key_hash)
+            .call()
+            .await?;
+        info!(
+            LOG,
+            "{:?} for {} is already registered: {}", public_key_hash, domain_name, is_valid; "func" => function_name!()
+        );
+        Ok(is_valid)
     }
 }
-
-

@@ -1,5 +1,3 @@
 [workspace]
-
-members = [
-    "packages/relayer",
-]
+members = ["packages/relayer", "packages/utils", "packages/scripts"]
+exclude = ["node_modules/*"]

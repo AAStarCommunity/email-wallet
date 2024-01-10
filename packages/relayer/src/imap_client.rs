@@ -1,33 +1,25 @@
-use anyhow::{anyhow, Result};
-use imap::types::{Fetch, Fetches};
-use imap::{Authenticator, Client, Session};
-use native_tls::{self, TlsStream};
+use crate::*;
+
+use std::time::Duration;
+
+use anyhow::anyhow;
+use async_imap::{types::Fetch, Session};
+use async_native_tls::TlsStream;
+use futures::TryStreamExt;
 use oauth2::reqwest::async_http_client;
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     PkceCodeChallenge, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
-use serde_json;
-use std::io;
-use std::net::TcpStream;
-use std::slice::Iter;
+use tokio::net::TcpStream;
 
-// We cache the domain name, port, and auth for reconnection on failure
-#[derive(Debug)]
-pub struct ImapClient {
-    imap_session: Session<TlsStream<TcpStream>>,
-    domain_name: String,
-    port: u16,
-    auth: IMAPAuth,
-}
-
-#[derive(Debug, Clone)]
-pub enum IMAPAuth {
+#[derive(Clone)]
+pub(crate) enum ImapAuth {
     Password {
-        id: String,
+        user_id: String,
         password: String,
     },
-    OAuth {
+    Oauth {
         user_id: String,
         client_id: String,
         client_secret: String,
@@ -37,15 +29,23 @@ pub enum IMAPAuth {
     },
 }
 
-pub struct OAuthed {
+#[derive(Clone)]
+pub(crate) struct ImapConfig {
+    pub(crate) domain_name: String,
+    pub(crate) port: u16,
+    pub(crate) auth: ImapAuth,
+    pub(crate) initially_checked: bool,
+}
+
+struct OAuth2 {
     user_id: String,
     access_token: String,
 }
 
-impl<'a> Authenticator for OAuthed {
+impl async_imap::Authenticator for &OAuth2 {
     type Response = String;
-    #[allow(unused_variables)]
-    fn process(&self, data: &[u8]) -> Self::Response {
+
+    fn process(&mut self, _: &[u8]) -> Self::Response {
         format!(
             "user={}\x01auth=Bearer {}\x01\x01",
             self.user_id, self.access_token
@@ -53,18 +53,24 @@ impl<'a> Authenticator for OAuthed {
     }
 }
 
+pub(crate) struct ImapClient {
+    session: Session<TlsStream<TcpStream>>,
+    config: ImapConfig,
+}
+
 impl ImapClient {
-    pub async fn construct(domain_name: &str, port: u16, auth: IMAPAuth) -> Result<Self> {
-        println!("Trying to construct...");
-        let tls = native_tls::TlsConnector::builder().build()?;
-        println!("Beginning connection process to IMAP server...");
-        let client = imap::ClientBuilder::new(domain_name, port)
-            .native_tls()
-            .expect("Could not connect to imap server");
-        println!("IMAP client connected to {:?} {:?}", domain_name, client);
-        let mut imap_session = match auth.clone() {
-            IMAPAuth::Password { id, password } => client.login(id, password).map_err(|e| e.0),
-            IMAPAuth::OAuth {
+    #[named]
+    pub(crate) async fn new(config: ImapConfig) -> Result<Self> {
+        let tcp_stream = TcpStream::connect((&*config.domain_name, config.port)).await?;
+        let tls = async_native_tls::TlsConnector::new();
+        let tls_stream = tls.connect(&*config.domain_name, tcp_stream).await?;
+        let client = async_imap::Client::new(tls_stream);
+
+        let mut session = match config.auth.clone() {
+            ImapAuth::Password { user_id, password } => {
+                client.login(user_id, password).await.map_err(|e| e.0)
+            }
+            ImapAuth::Oauth {
                 user_id,
                 client_id,
                 client_secret,
@@ -79,113 +85,139 @@ impl ImapClient {
                     Some(TokenUrl::new(token_url)?),
                 )
                 .set_redirect_uri(RedirectUrl::new(redirect_url)?);
+
                 let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
                 let (auth_url, _) = oauth_client
                     .authorize_url(CsrfToken::new_random)
-                    // Set the desired scopes.
                     .add_scope(Scope::new("https://mail.google.com/".to_string()))
-                    // Set the PKCE code challenge.
                     .set_pkce_challenge(pkce_challenge)
                     .url();
-                println!("Browse to: {}", auth_url);
-                let mut auth_code = String::new();
-                io::stdin().read_line(&mut auth_code)?;
+
+                let server = tiny_http::Server::http("127.0.0.1:8000").unwrap();
+                webbrowser::open(auth_url.as_ref())?;
+                let request = server.recv()?;
+                let url = request.url().to_string();
+                let auth_code = url.split("code=").collect::<Vec<&str>>()[1]
+                    .split('&')
+                    .next()
+                    .unwrap_or("");
+                let response =
+                    tiny_http::Response::from_string("You can close this window now.".to_string());
+                request.respond(response).unwrap();
+
+                trace!(LOG, "Auth Code that I captured {}", auth_code; "func" => function_name!());
+
                 let token_result = oauth_client
-                    .exchange_code(AuthorizationCode::new(auth_code))
-                    // Set the PKCE code verifier.
+                    .exchange_code(AuthorizationCode::new(auth_code.to_string()))
                     .set_pkce_verifier(pkce_verifier)
                     .request_async(async_http_client)
                     .await?;
+
                 let access_token = serde_json::to_string(token_result.access_token())?;
-                let oauthed = OAuthed {
+                let oauthed = OAuth2 {
                     user_id,
                     access_token,
                 };
-                client.authenticate("XOAUTH2", &oauthed).map_err(|e| e.0)
+
+                client
+                    .authenticate("XOAUTH2", &oauthed)
+                    .await
+                    .map_err(|e| e.0)
             }
         }?;
-        // Turn on debug output so we can see the actual traffic coming
-        // from the server and how it is handled in our callback.
-        // This wouldn't be turned on in a production build, but is helpful
-        // in examples and for debugging.
-        imap_session.debug = true;
-        imap_session.select("INBOX")?;
-        Ok(Self {
-            imap_session,
-            domain_name: domain_name.to_string(),
-            port,
-            auth,
-        })
+
+        session.select("INBOX").await?;
+
+        trace!(LOG, "ImapClient connected succesfully!"; "func" => function_name!());
+
+        Ok(Self { session, config })
     }
 
-    pub async fn wait_new_email(&mut self) -> Result<()> {
+    #[named]
+    pub(crate) async fn retrieve_new_emails(&mut self) -> Result<Vec<Vec<Fetch>>> {
+        if !self.config.initially_checked {
+            self.config.initially_checked = true;
+            let result =
+                tokio::time::timeout(Duration::from_secs(10), self.get_unseen_emails()).await;
+            if let Ok(Ok(result)) = result {
+                return Ok(result);
+            }
+        }
+
+        // let mut new_client = self.wait_new_email().await?;
+        trace!(LOG, "Reconnecting..."; "func" => function_name!());
+        self.reconnect().await?;
+        trace!(LOG, "Reconnected!"; "func" => function_name!());
+        // Ok((new_client.get_unseen_emails().await?, new_client))
+        Ok(self.get_unseen_emails().await?)
+    }
+
+    #[named]
+    async fn get_unseen_emails(&mut self) -> Result<Vec<Vec<Fetch>>> {
+        trace!(LOG, "Getting unseen emails..."; "func" => function_name!());
         loop {
-            if self.idle_wait().await.is_err() {
-                println!("Connection reset, reconnecting...");
-                self.reconnect().await?;
-            } else {
-                return Ok(());
+            match self.session.uid_search("UNSEEN").await {
+                Ok(uids) => {
+                    trace!(LOG, "Got unseen emails: {:?}!", uids; "func" => function_name!());
+                    let mut results = vec![];
+                    for uid in uids {
+                        let res = self
+                            .session
+                            .uid_fetch(uid.to_string(), "(BODY[] ENVELOPE)")
+                            .await?;
+                        let res = res.try_collect::<Vec<_>>().await?;
+                        results.push(res);
+                    }
+                    trace!(LOG, "Got unseen emails: {:?}!", results; "func" => function_name!());
+                    return Ok(results);
+                }
+                Err(e) => {
+                    error!(LOG, "Connection reset, reconnecting..."; "func" => function_name!());
+                    self.reconnect().await?;
+                }
             }
         }
     }
 
-    async fn idle_wait(&mut self) -> Result<()> {
-        let idle_result = self.imap_session.idle().wait_while(|response| {false});
-        match idle_result {
-            Ok(reason) => println!("IDLE finished normally {:?}", reason),
-            Err(e) => println!("IDLE finished with error {:?}", e),
-        };
-        Ok(())
-    }
+    // async fn wait_new_email(mut self) -> Result<Self> {
+    //     loop {
+    //         let mut idle = self.session.idle();
+    //         idle.init().await?;
+    //         let result = idle.wait_with_timeout(Duration::from_secs(29 * 60)).0.await;
+    //         let is_new_data = matches!(result, Ok(NewData(_)));
+
+    //         let session_result = idle.done().await;
+
+    //         self = match session_result {
+    //             Ok(session) => Self { session, ..self },
+    //             Err(_) => Self::new(self.config).await.unwrap(),
+    //         };
+
+    //         if is_new_data {
+    //             return Ok(self);
+    //         } else {
+    //             self.reconnect().await?;
+    //         }
+    //     }
+    // }
 
     async fn reconnect(&mut self) -> Result<()> {
+        const MAX_RETRIES: u32 = 5;
         let mut retry_count = 0;
-        let mut MAX_RETRIES = 5;
+
         while retry_count < MAX_RETRIES {
-            match ImapClient::construct(self.domain_name.as_str(), self.port, self.auth.clone())
-                .await
-            {
+            match ImapClient::new(self.config.clone()).await {
                 Ok(new_client) => {
-                    self.imap_session = new_client.imap_session;
+                    self.session = new_client.session;
                     return Ok(());
                 }
-                Err(e) => {
-                    println!("Failed to reconnect: {:?}", e);
+                Err(_) => {
                     retry_count += 1;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
             }
         }
-        Err(anyhow!(
-            "Failed to reconnect after {} attempts",
-            MAX_RETRIES
-        ))
-    }
 
-
-    pub async fn retrieve_new_emails(&mut self) -> Result<Vec<Fetches>> {
-        loop {
-            match self.imap_session.uid_search("UNSEEN") {
-                Ok(uids) => {
-                    let mut fetches = vec![];
-                    for (idx, uid) in uids.into_iter().enumerate() {
-                        println!("uid {}", uid);
-                        let fetched = self
-                            .imap_session
-                            .uid_fetch(uid.to_string(), "(BODY[] ENVELOPE)")?;
-                        fetches.push(fetched);
-                    }
-                    return Ok(fetches);
-                }
-                Err(e) => {
-                    println!("Connection reset, reconnecting...");
-                    if let Err(e) = self.reconnect().await {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        Err(anyhow!("{IMAP_RECONNECT_ERROR}"))
     }
 }
-
-

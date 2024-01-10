@@ -2,57 +2,53 @@
 name = "relayer"
 version = "0.1.0"
 edition = "2021"
-publish = false
 
 [dependencies]
-# axum = { version = "0.6.12", features = ["multipart"] }
+tower-http = { version = "0.4", git = "https://github.com/tower-rs/tower-http.git", features = [
+    "cors",
+] }
+tokio = { version = "1.0", features = ["full"] }
+sled = "0.34.2"
+anyhow = "1.0.75"
+dotenv = "0.15.0"
+oauth2 = "4.3.0"
+async-imap = { version = "0.9.1", default-features = false, features = [
+    "runtime-tokio",
+] }
+async-native-tls = { version = "0.5.0", default-features = false, features = [
+    "runtime-tokio",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.68"
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
-# tracing-subscriber = { version = "0   .3", features = ["env-filter"] }
-reqwest = { version = "0.11", features = ["json"] }
-mail-auth = { git = "https://github.com/Divide-By-0/mail-auth.git", version = "0.3.0", branch = "main" }
-regex = "1.5"
-dotenv = "0.15.0"
-base64 = "0.21.0"
-hyper = "0.14.25"
-# embed_js = "0.1.4"
-# duct = "0.13.6"
+webbrowser = "0.8.11"
+tiny_http = "0.12.0"
+lettre = { version = "0.10.4", features = ["tokio1", "tokio1-native-tls"] }
+ethers = "2.0.10"
+email-wallet-utils = { path = "../utils" }
 futures = "0.3.28"
-trust-dns-resolver = "0.22.0"
-sha2 = "0.10.6"
-# tower = "0.4.13"
-# tower-http = "0.4.0"
-async-trait = "0.1.68"
-# multipart = "0.18.0"
-bytes = "1.4.0"
-http = "0.2.9"
-futures-util = "0.3.28"
-imap = "3.0.0-alpha.10"
-urlencoding = "1.1"
-anyhow = "1.0.70"
-native-tls = "0.2.11"
-oauth2 = "4.3.0"
-# cfdkim = { version = "0.2.6", git = "https://github.com/SoraSuegami/dkim.git" }
-fancy-regex = "0.11.0"
-ethers-providers = "2.0.2"
-ethers-signers = "2.0.2"
-ethers-core = "2.0.2"
-ethers = "2.0.3"
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio"] }
+regex = "1.10.2"
+axum = "0.6.20"
 rand = "0.8.5"
+reqwest = "0.11.22"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2.16"
 hex = "0.4.3"
-hex-literal = "0.4.1"
-lettre = "0.10.4"
-sled = "0.34.7"
-# arkworks-mimc = { version = "0.3.0", features = ["mimc-5-220-bn254"] }
-ark-ff = { version = "^0.3.0", default-features = false }
-ark-ec = { version = "^0.3.0", default-features = false }
-ark-ed-on-bn254 = { version = "^0.3.0", default-features = false, features = ["r1cs"] }
-ark-bn254 = { version = "^0.3.0", default-features = false, features = ["curve"] }
-ark-std = { version = "^0.3.0", default-features = false }
-arkworks-mimc = { version = "^0.2.0", default-features = false, features = ["r1cs", "mimc-5-220-bn254"] }
-rustc-hex = "2.1.0"
-num-bigint = "0.4.3"
-num-traits = "0.2.15"
-# mailparse = "0.14.0"
+chrono = "0.4.31"
+ff = { version = "0.13.0", default-features = false, features = ["std"] }
+async-trait = "0.1.36"
+handlebars = "4.4.0"
+graphql_client = { version = "0.13.0", features = ["reqwest"] }
+ic-utils = { version = "0.30.0" }
+ic-agent = { version = "0.30.0", features = ["pem", "reqwest"] }
+candid = "0.9.11"
+lazy_static = "1.4"
+slog = { version = "2.7.0", features = ["max_level_trace", "release_max_level_warn"] }
+slog-async = "2.8.0"
+slog-term = "2.9.0"
+slog-json = "2.6.1"
+file-rotate = "0.7.5"
+function_name = "0.3.0"
+
+[build-dependencies]
+ethers = "2.0.10"
